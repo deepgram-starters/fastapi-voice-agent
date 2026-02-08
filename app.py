@@ -18,7 +18,6 @@ load_dotenv(override=False)
 CONFIG = {
     "port": int(os.environ.get("PORT", 8081)),
     "host": os.environ.get("HOST", "0.0.0.0"),
-    "frontend_port": int(os.environ.get("FRONTEND_PORT", 8080)),
 }
 
 def load_api_key():
@@ -33,20 +32,16 @@ DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
 app = FastAPI(title="Deepgram Voice Agent API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        f"http://localhost:{CONFIG['frontend_port']}",
-        f"http://127.0.0.1:{CONFIG['frontend_port']}",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.websocket("/agent/converse")
+@app.websocket("/api/voice-agent")
 async def voice_agent(websocket: WebSocket):
     """Raw WebSocket proxy endpoint for voice agent"""
     await websocket.accept()
-    print("Client connected to /agent/converse")
+    print("Client connected to /api/voice-agent")
 
     deepgram_ws = None
     forward_task = None
