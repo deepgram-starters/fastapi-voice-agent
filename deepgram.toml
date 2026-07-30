@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/fastapi-voice-agent"
 useCase = "voice-agent"
 language = "python"
 framework = "fastapi"
-sdk = "N/A"
+sdk = "deepgram-sdk"
 tags = ["voice-agent", "conversational-ai", "voice-ai", "voice-bot", "python", "fastapi"]
 
 [install.pre]
