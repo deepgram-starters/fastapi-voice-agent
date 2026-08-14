@@ -19,8 +19,17 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import websockets
 import toml
+
+from deepgram import AsyncDeepgramClient
+from deepgram.core.unchecked_base_model import construct_type
+from deepgram.core.api_error import ApiError
+from deepgram.agent.v1.types import (
+    AgentV1InjectUserMessage,
+    AgentV1Settings,
+    AgentV1UpdatePrompt,
+    AgentV1UpdateSpeak,
+)
 
 load_dotenv(override=False)
 
@@ -36,7 +45,23 @@ def load_api_key():
     return api_key
 
 API_KEY = load_api_key()
-DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
+
+# One async SDK client, reused across connections; the browser never sees the API
+# key. agent.v1.connect() targets wss://agent.deepgram.com/v1/agent/converse and
+# handles the Authorization header, so the raw websockets proxy is no longer needed.
+deepgram = AsyncDeepgramClient(api_key=API_KEY)
+
+
+def _safe_error_detail(e):
+    """Sanitize a Deepgram error before it reaches the browser or logs.
+
+    NEVER surface str(e): a deepgram-sdk ApiError stringifies its request
+    headers, which include Authorization: Token <api-key> — a bad connect
+    would otherwise leak the key to the browser and the server logs.
+    """
+    if isinstance(e, ApiError):
+        return f"Deepgram rejected the connection (HTTP {e.status_code})"
+    return f"Failed to connect to Deepgram ({type(e).__name__})"
 
 # ============================================================================
 # SESSION AUTH - JWT tokens for API protection
@@ -154,87 +179,117 @@ async def voice_agent(websocket: WebSocket):
     await websocket.accept(subprotocol=valid_proto)
     print("Client connected to /api/voice-agent")
 
-    deepgram_ws = None
     forward_task = None
-    stop_event = asyncio.Event()
 
     try:
-        # Connect to Deepgram Agent API
+        # Connect to Deepgram's Voice Agent API through the SDK. The browser still
+        # owns the agent protocol (it builds the Settings/Update frames), so the
+        # backend stays a thin bridge; only the Deepgram-facing transport moved
+        # from raw websockets to the SDK's agent.v1 socket client.
         print("Connecting to Deepgram Agent API...")
+        async with deepgram.agent.v1.connect() as connection:
+            print("✓ Connected to Deepgram Agent API")
 
-        deepgram_ws = await websockets.connect(
-            DEEPGRAM_AGENT_URL,
-            additional_headers={"Authorization": f"Token {API_KEY}"}
-        )
-        print("✓ Connected to Deepgram Agent API")
+            # Task to forward messages from Deepgram to client
+            async def forward_from_deepgram():
+                try:
+                    async for message in connection:
+                        if isinstance(message, (bytes, bytearray)):
+                            await websocket.send_bytes(bytes(message))
+                        elif hasattr(message, "model_dump_json"):
+                            # Typed event -> re-serialize to the same wire JSON.
+                            await websocket.send_text(message.model_dump_json())
+                        elif isinstance(message, (dict, list)):
+                            await websocket.send_text(json.dumps(message))
+                        else:
+                            await websocket.send_text(str(message))
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    detail = _safe_error_detail(e)
+                    print(f"Error forwarding from Deepgram: {detail}")
+                    await websocket.send_text(json.dumps({
+                        "type": "Error",
+                        "description": detail,
+                        "code": "PROVIDER_ERROR"
+                    }))
 
-        # Task to forward messages from Deepgram to client
-        async def forward_from_deepgram():
+            # Start forwarding task
+            forward_task = asyncio.create_task(forward_from_deepgram())
+
+            # Forward messages from client to Deepgram. Binary frames are mic audio;
+            # JSON frames are control messages the browser builds. construct_type is
+            # the SDK's own deserializer and preserves every field (nested providers,
+            # future settings), so behavior matches the previous verbatim proxy.
             try:
-                async for message in deepgram_ws:
-                    if stop_event.is_set():
+                while True:
+                    message = await websocket.receive()
+
+                    if message.get("type") == "websocket.disconnect":
                         break
 
-                    # Forward message to client
-                    if isinstance(message, bytes):
-                        await websocket.send_bytes(message)
+                    data_bytes = message.get("bytes")
+                    if data_bytes is not None:
+                        await connection.send_media(data_bytes)
+                        continue
+
+                    text = message.get("text")
+                    if text is None:
+                        continue
+
+                    try:
+                        payload = json.loads(text)
+                    except (ValueError, TypeError):
+                        print("Ignoring non-JSON message from client")
+                        continue
+
+                    msg_type = payload.get("type")
+                    if msg_type == "Settings":
+                        await connection.send_settings(
+                            construct_type(type_=AgentV1Settings, object_=payload)
+                        )
+                    elif msg_type == "UpdateSpeak":
+                        await connection.send_update_speak(
+                            construct_type(type_=AgentV1UpdateSpeak, object_=payload)
+                        )
+                    elif msg_type == "UpdatePrompt":
+                        await connection.send_update_prompt(
+                            construct_type(type_=AgentV1UpdatePrompt, object_=payload)
+                        )
+                    elif msg_type == "InjectUserMessage":
+                        await connection.send_inject_user_message(
+                            construct_type(type_=AgentV1InjectUserMessage, object_=payload)
+                        )
                     else:
-                        await websocket.send_text(message)
+                        # Unrecognized control frame: forward verbatim so a new
+                        # client message type is never silently dropped.
+                        await connection._send(payload)
 
-            except websockets.exceptions.ConnectionClosed as e:
-                print(f"Deepgram connection closed: {e.code} {e.reason}")
-            except asyncio.CancelledError:
-                pass
+            except WebSocketDisconnect:
+                print("Client disconnected")
             except Exception as e:
-                print(f"Error forwarding from Deepgram: {e}")
-                await websocket.send_text(json.dumps({
-                    "type": "Error",
-                    "description": str(e),
-                    "code": "PROVIDER_ERROR"
-                }))
-
-        # Start forwarding task
-        forward_task = asyncio.create_task(forward_from_deepgram())
-
-        # Forward messages from client to Deepgram
-        try:
-            while True:
-                message = await websocket.receive()
-
-                if "text" in message:
-                    await deepgram_ws.send(message["text"])
-                elif "bytes" in message:
-                    await deepgram_ws.send(message["bytes"])
-
-        except WebSocketDisconnect:
-            print("Client disconnected")
-        except Exception as e:
-            print(f"Error forwarding to Deepgram: {e}")
+                print(f"Error forwarding to Deepgram: {_safe_error_detail(e)}")
 
     except Exception as e:
-        print(f"WebSocket error: {e}")
-        await websocket.send_text(json.dumps({
-            "type": "Error",
-            "description": str(e),
-            "code": "CONNECTION_FAILED"
-        }))
+        detail = _safe_error_detail(e)
+        print(f"WebSocket error: {detail}")
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "Error",
+                "description": detail,
+                "code": "CONNECTION_FAILED"
+            }))
+        except Exception:
+            pass
 
     finally:
         # Cleanup
-        stop_event.set()
-
         if forward_task:
             forward_task.cancel()
             try:
                 await forward_task
             except asyncio.CancelledError:
                 pass
-
-        if deepgram_ws:
-            try:
-                await deepgram_ws.close()
-            except Exception as e:
-                print(f"Error closing Deepgram connection: {e}")
 
         print("Connection cleanup complete")
 
