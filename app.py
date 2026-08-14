@@ -23,6 +23,7 @@ import toml
 
 from deepgram import AsyncDeepgramClient
 from deepgram.core.unchecked_base_model import construct_type
+from deepgram.core.api_error import ApiError
 from deepgram.agent.v1.types import (
     AgentV1InjectUserMessage,
     AgentV1Settings,
@@ -49,6 +50,18 @@ API_KEY = load_api_key()
 # key. agent.v1.connect() targets wss://agent.deepgram.com/v1/agent/converse and
 # handles the Authorization header, so the raw websockets proxy is no longer needed.
 deepgram = AsyncDeepgramClient(api_key=API_KEY)
+
+
+def _safe_error_detail(e):
+    """Sanitize a Deepgram error before it reaches the browser or logs.
+
+    NEVER surface str(e): a deepgram-sdk ApiError stringifies its request
+    headers, which include Authorization: Token <api-key> — a bad connect
+    would otherwise leak the key to the browser and the server logs.
+    """
+    if isinstance(e, ApiError):
+        return f"Deepgram rejected the connection (HTTP {e.status_code})"
+    return f"Failed to connect to Deepgram ({type(e).__name__})"
 
 # ============================================================================
 # SESSION AUTH - JWT tokens for API protection
@@ -193,10 +206,11 @@ async def voice_agent(websocket: WebSocket):
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
-                    print(f"Error forwarding from Deepgram: {e}")
+                    detail = _safe_error_detail(e)
+                    print(f"Error forwarding from Deepgram: {detail}")
                     await websocket.send_text(json.dumps({
                         "type": "Error",
-                        "description": str(e),
+                        "description": detail,
                         "code": "PROVIDER_ERROR"
                     }))
 
@@ -254,14 +268,15 @@ async def voice_agent(websocket: WebSocket):
             except WebSocketDisconnect:
                 print("Client disconnected")
             except Exception as e:
-                print(f"Error forwarding to Deepgram: {e}")
+                print(f"Error forwarding to Deepgram: {_safe_error_detail(e)}")
 
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        detail = _safe_error_detail(e)
+        print(f"WebSocket error: {detail}")
         try:
             await websocket.send_text(json.dumps({
                 "type": "Error",
-                "description": str(e),
+                "description": detail,
                 "code": "CONNECTION_FAILED"
             }))
         except Exception:
