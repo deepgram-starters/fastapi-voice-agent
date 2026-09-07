@@ -1,10 +1,10 @@
 """
-FastAPI Voice Agent Starter - Raw WebSocket proxy to Deepgram
+FastAPI Voice Agent Starter - SDK-backed WebSocket bridge to Deepgram
 
 Key Features:
 - WebSocket endpoint: /api/voice-agent
 - JWT session auth for API protection
-- Raw WebSocket proxy to Deepgram Agent API
+- SDK-backed bridge to Deepgram Agent API
 """
 
 import os
@@ -157,7 +157,7 @@ async def get_session():
 
 @app.websocket("/api/voice-agent")
 async def voice_agent(websocket: WebSocket):
-    """Raw WebSocket proxy endpoint for voice agent"""
+    """SDK-backed WebSocket bridge endpoint for the voice agent."""
     # Validate JWT from subprotocol
     protocols = websocket.headers.get("sec-websocket-protocol", "")
     protocol_list = [p.strip() for p in protocols.split(",")]
@@ -193,7 +193,10 @@ async def voice_agent(websocket: WebSocket):
             # Task to forward messages from Deepgram to client
             async def forward_from_deepgram():
                 try:
-                    async for message in connection:
+                    while True:
+                        # recv() preserves unknown events as dictionaries; the SDK
+                        # iterator drops them before callers can forward them.
+                        message = await connection.recv()
                         if isinstance(message, (bytes, bytearray)):
                             await websocket.send_bytes(bytes(message))
                         elif hasattr(message, "model_dump_json"):
